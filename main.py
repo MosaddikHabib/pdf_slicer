@@ -1,65 +1,117 @@
-import tkinter as tk
-from tkinter import filedialog, simpledialog, messagebox
+import ttkbootstrap as ttk
+from ttkbootstrap.constants import *
+from tkinter import filedialog, messagebox
 from PyPDF2 import PdfReader, PdfWriter
+import os
 
-def slice_pdf():
-    # Open file dialog to choose PDF
-    file_path = filedialog.askopenfilename(
-        title="Select PDF File",
-        filetypes=[("PDF Files", "*.pdf")]
-    )
+class PDFSlicerApp(ttk.Window):
+    def __init__(self):
+        super().__init__(themename="superhero")  # Try "cosmo", "darkly", etc.
+        self.title("📄 PDF Slicer Dashboard")
+        self.geometry("700x400")
+        self.resizable(False, False)
 
-    if not file_path:
-        messagebox.showwarning("No file selected", "Please select a PDF file.")
-        return
+        self.pdf_path = None
+        self.total_pages = 0
 
-    # Ask user for page range (e.g. 2-5)
-    page_range = simpledialog.askstring(
-        "Page Range",
-        "Enter page range (e.g., 2-5):"
-    )
+        self.create_widgets()
 
-    if not page_range or "-" not in page_range:
-        messagebox.showerror("Invalid input", "Please enter a valid page range like 2-5.")
-        return
+    def create_widgets(self):
+        ttk.Label(self, text="PDF Slicer Dashboard", font=("Helvetica", 20, "bold")).pack(pady=20)
 
-    try:
-        start, end = map(int, page_range.split("-"))
-    except ValueError:
-        messagebox.showerror("Invalid input", "Page range must be two numbers separated by '-'.")
-        return
+        frame = ttk.Frame(self, padding=20)
+        frame.pack(fill=X, padx=40)
 
-    # Read original PDF
-    reader = PdfReader(file_path)
-    writer = PdfWriter()
+        # File section
+        ttk.Label(frame, text="Select PDF File:", font=("Helvetica", 12)).grid(row=0, column=0, sticky=W, pady=10)
+        self.file_label = ttk.Label(frame, text="No file selected", font=("Helvetica", 10), width=40)
+        self.file_label.grid(row=0, column=1, sticky=W)
+        ttk.Button(frame, text="Browse", bootstyle=INFO, command=self.browse_pdf).grid(row=0, column=2, padx=10)
 
-    total_pages = len(reader.pages)
+        # Page range section
+        ttk.Label(frame, text="Enter Page Range (e.g., 2-5, 7-9):", font=("Helvetica", 12)).grid(row=1, column=0, sticky=W, pady=10)
+        self.range_entry = ttk.Entry(frame, width=30)
+        self.range_entry.grid(row=1, column=1, sticky=W)
 
-    if start < 1 or end > total_pages or start > end:
-        messagebox.showerror("Error", f"Invalid range! PDF has {total_pages} pages.")
-        return
+        # Output file
+        ttk.Label(frame, text="Output File Name:", font=("Helvetica", 12)).grid(row=2, column=0, sticky=W, pady=10)
+        self.output_entry = ttk.Entry(frame, width=30)
+        self.output_entry.grid(row=2, column=1, sticky=W)
+        self.output_entry.insert(0, "sliced_output.pdf")
 
-    # Add pages to new PDF
-    for i in range(start - 1, end):
-        writer.add_page(reader.pages[i])
+        # Slice button
+        ttk.Button(self, text="✂ Slice PDF", bootstyle=SUCCESS, command=self.slice_pdf).pack(pady=25)
 
-    # Ask where to save
-    save_path = filedialog.asksaveasfilename(
-        defaultextension=".pdf",
-        filetypes=[("PDF Files", "*.pdf")],
-        title="Save new PDF as..."
-    )
+        # Info area
+        self.info_label = ttk.Label(self, text="", font=("Helvetica", 10))
+        self.info_label.pack()
 
-    if not save_path:
-        return
+    def browse_pdf(self):
+        file_path = filedialog.askopenfilename(filetypes=[("PDF Files", "*.pdf")])
+        if file_path:
+            self.pdf_path = file_path
+            self.file_label.config(text=os.path.basename(file_path))
+            try:
+                reader = PdfReader(file_path)
+                self.total_pages = len(reader.pages)
+                self.info_label.config(text=f"✅ Loaded successfully. Total Pages: {self.total_pages}")
+            except Exception as e:
+                messagebox.showerror("Error", f"Cannot read PDF file.\n{e}")
 
-    # Write new PDF
-    with open(save_path, "wb") as output_file:
-        writer.write(output_file)
+    def parse_ranges(self, text):
+        """Parse input like 1-3, 5-6 into [1,2,3,5,6]"""
+        pages = set()
+        for part in text.split(","):
+            part = part.strip()
+            if "-" in part:
+                start, end = map(int, part.split("-"))
+                pages.update(range(start, end + 1))
+            else:
+                pages.add(int(part))
+        return sorted(pages)
 
-    messagebox.showinfo("Success", f"New PDF created successfully!\nSaved to:\n{save_path}")
+    def slice_pdf(self):
+        if not self.pdf_path:
+            messagebox.showerror("Error", "Please select a PDF file first.")
+            return
 
-# GUI setup
-root = tk.Tk()
-root.withdraw()  # Hide main window
-slice_pdf()
+        range_text = self.range_entry.get()
+        if not range_text:
+            messagebox.showerror("Error", "Please enter a valid page range.")
+            return
+
+        output_name = self.output_entry.get()
+        if not output_name.endswith(".pdf"):
+            output_name += ".pdf"
+
+        try:
+            reader = PdfReader(self.pdf_path)
+            writer = PdfWriter()
+            total_pages = len(reader.pages)
+            pages_to_add = self.parse_ranges(range_text)
+
+            for p in pages_to_add:
+                if 1 <= p <= total_pages:
+                    writer.add_page(reader.pages[p - 1])
+
+            save_path = filedialog.asksaveasfilename(
+                initialfile=output_name,
+                defaultextension=".pdf",
+                filetypes=[("PDF Files", "*.pdf")]
+            )
+
+            if not save_path:
+                return
+
+            with open(save_path, "wb") as f:
+                writer.write(f)
+
+            messagebox.showinfo("Success", f"✅ Sliced PDF saved as:\n{save_path}")
+
+        except Exception as e:
+            messagebox.showerror("Error", f"Something went wrong.\n{e}")
+
+# Run the app
+if __name__ == "__main__":
+    app = PDFSlicerApp()
+    app.mainloop()
