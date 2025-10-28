@@ -5,8 +5,20 @@ import ttkbootstrap as ttk
 from ttkbootstrap.constants import *
 from tkinter import filedialog, messagebox, simpledialog
 
-# Alternative to PyMuPDF: pikepdf (QPDF-based, works on Python 3.13)
+# Core PDF lib (works on Python 3.13)
 import pikepdf
+
+# Optional preview stack
+try:
+    import fitz  # PyMuPDF (for rendering PDF pages to images)
+except Exception:
+    fitz = None
+
+try:
+    from PIL import Image, ImageTk
+except Exception:
+    Image = None
+    ImageTk = None
 
 
 def parse_ranges(text, *, keep_input_order=False):
@@ -16,7 +28,6 @@ def parse_ranges(text, *, keep_input_order=False):
     - Positive only
     - keep_input_order: preserve order the user typed (vs sorted numeric)
     """
-    # Use an ordered structure to dedupe while preserving insertion order.
     seen = {}
     for part in text.split(","):
         part = part.strip()
@@ -49,9 +60,10 @@ def parse_ranges(text, *, keep_input_order=False):
 
 class PDFSlicerApp(ttk.Window):
     def __init__(self):
-        super().__init__(themename="darkly")  # try "superhero", "cosmo", "flatly", etc.
+        # Try a brighter theme
+        super().__init__(themename="superhero")  # nice contrasts: superhero, vapor, cyborg, darkly
         self.title("📄 PDF Slicer Dashboard (pikepdf)")
-        self.geometry("880x520")
+        self.geometry("1120x610")
         self.resizable(False, False)
 
         self.pdf_path = None
@@ -63,75 +75,132 @@ class PDFSlicerApp(ttk.Window):
         self.keep_order_var = ttk.BooleanVar(value=False)
         self.open_when_done_var = ttk.BooleanVar(value=True)
 
+        # preview state
+        self.preview_doc = None      # fitz.Document
+        self.preview_page_var = ttk.IntVar(value=1)
+        self._preview_photo = None   # keep reference to avoid GC
+        self._preview_enabled = bool(fitz and Image and ImageTk)
+
         self.build_ui()
 
+    # ---------- UI ----------
     def build_ui(self):
         # Header
-        header = ttk.Frame(self, padding=(20, 20, 20, 10))
+        header = ttk.Frame(self, padding=(18, 18, 18, 10))
         header.pack(fill=X)
         ttk.Label(header, text="PDF Slicer Dashboard", font=("Helvetica", 22, "bold")).pack(side=LEFT)
-        ttk.Label(header, text="Powered by pikepdf (QPDF)", bootstyle=INFO).pack(side=RIGHT, padx=10)
+        ttk.Label(header, text="Powered by pikepdf • Preview via PyMuPDF", bootstyle=INFO).pack(side=RIGHT, padx=10)
 
-        # Main card
-        card = ttk.Frame(self, padding=20, bootstyle="secondary")
-        card.pack(fill=X, padx=24, pady=10)
+        # main layout: left control card + right preview card
+        body = ttk.Frame(self, padding=(16, 0, 16, 16))
+        body.pack(fill=BOTH, expand=YES)
+
+        # LEFT: controls
+        left = ttk.Frame(body)
+        left.pack(side=LEFT, fill=Y)
+
+        card = ttk.Frame(left, padding=20, bootstyle="secondary")
+        card.pack(fill=X, padx=(0, 16), pady=10)
 
         # Row: file
-        ttk.Label(card, text="Select PDF:", font=("-size", 11)).grid(row=0, column=0, sticky=W, pady=6)
+        ttk.Label(card, text="Select PDF:", font=("-size", 11)).grid(row=0, column=0, sticky=W, pady=(2, 6))
         self.file_label = ttk.Label(card, text="No file selected", width=52, anchor=W)
         self.file_label.grid(row=0, column=1, sticky=W, padx=(10, 10))
         ttk.Button(card, text="Browse", bootstyle=INFO, command=self.browse_pdf).grid(row=0, column=2, padx=(6, 0))
 
+        # Page range info (auto after load)
+        self.page_range_badge = ttk.Label(card, text="Pages: —", bootstyle="INFO-INVERSE", padding=(8, 4))
+        self.page_range_badge.grid(row=1, column=1, sticky=W, pady=(0, 10), padx=(10, 10))
+
         # Row: page ranges + helpers
-        ttk.Label(card, text="Page Ranges:", font=("-size", 11)).grid(row=1, column=0, sticky=W, pady=6)
+        ttk.Label(card, text="Page Ranges:", font=("-size", 11)).grid(row=2, column=0, sticky=W, pady=6)
         self.range_entry = ttk.Entry(card, width=40)
-        self.range_entry.grid(row=1, column=1, sticky=W, padx=(10, 10))
+        self.range_entry.grid(row=2, column=1, sticky=W, padx=(10, 10))
 
         helpers = ttk.Frame(card)
-        helpers.grid(row=1, column=2, sticky=W)
+        helpers.grid(row=2, column=2, sticky=W)
         ttk.Button(helpers, text="All", bootstyle=SECONDARY, command=self.fill_all).pack(side=LEFT, padx=2)
         ttk.Button(helpers, text="Odd", bootstyle=SECONDARY, command=self.fill_odd).pack(side=LEFT, padx=2)
         ttk.Button(helpers, text="Even", bootstyle=SECONDARY, command=self.fill_even).pack(side=LEFT, padx=2)
 
-        ttk.Label(card, text="e.g., 1-3, 8, 10-12", bootstyle=SECONDARY).grid(row=2, column=1, sticky=W, pady=(2, 0))
+        ttk.Label(card, text="e.g., 1-3, 8, 10-12", bootstyle=SECONDARY).grid(row=3, column=1, sticky=W, pady=(2, 8))
 
         # Row: mode (extract/delete) + keep order
         mode_row = ttk.Frame(card)
-        mode_row.grid(row=3, column=1, sticky=W, pady=(10, 0))
+        mode_row.grid(row=4, column=1, sticky=W, pady=(2, 0))
         ttk.Radiobutton(mode_row, text="Extract selected pages", variable=self.mode_var,
                         value="extract", bootstyle=SUCCESS).pack(side=LEFT, padx=(0, 10))
         ttk.Radiobutton(mode_row, text="Delete selected pages", variable=self.mode_var,
                         value="delete", bootstyle=WARNING).pack(side=LEFT)
 
         opts_row = ttk.Frame(card)
-        opts_row.grid(row=4, column=1, sticky=W, pady=(6, 0))
+        opts_row.grid(row=5, column=1, sticky=W, pady=(6, 0))
         ttk.Checkbutton(opts_row, text="Keep input order", variable=self.keep_order_var).pack(side=LEFT, padx=(0, 10))
         ttk.Checkbutton(opts_row, text="Open file when done", variable=self.open_when_done_var).pack(side=LEFT)
 
         # Row: output name
-        ttk.Label(card, text="Output File Name:", font=("-size", 11)).grid(row=5, column=0, sticky=W, pady=10)
+        ttk.Label(card, text="Output File Name:", font=("-size", 11)).grid(row=6, column=0, sticky=W, pady=10)
         self.output_entry = ttk.Entry(card, width=40)
-        self.output_entry.grid(row=5, column=1, sticky=W, padx=(10, 10))
+        self.output_entry.grid(row=6, column=1, sticky=W, padx=(10, 10))
         self.output_entry.insert(0, "sliced_output.pdf")
 
         # Info area
-        self.info = ttk.Label(self, text="Load a PDF to see details.", bootstyle=SECONDARY)
-        self.info.pack(fill=X, padx=30, pady=(4, 12))
+        self.info = ttk.Label(left, text="Load a PDF to see details.", bootstyle=SECONDARY, padding=(6, 4))
+        self.info.pack(fill=X, pady=(8, 8))
 
         # Progress
-        pwrap = ttk.Frame(self, padding=(30, 0, 30, 0))
+        pwrap = ttk.Frame(left, padding=(0, 0, 0, 6))
         pwrap.pack(fill=X)
         self.progress = ttk.Progressbar(pwrap, bootstyle="info-striped", mode="determinate")
         self.progress.pack(fill=X)
 
         # Action buttons
-        btns = ttk.Frame(self, padding=20)
+        btns = ttk.Frame(left, padding=(0, 6, 0, 0))
         btns.pack()
-        ttk.Button(btns, text="✂ Slice PDF", bootstyle=SUCCESS, command=self.slice_pdf, width=20).pack(side=LEFT, padx=8)
-        ttk.Button(btns, text="Reset", bootstyle=SECONDARY, command=self.reset, width=12).pack(side=LEFT, padx=8)
-        ttk.Button(btns, text="Quit", bootstyle=DANGER, command=self.destroy, width=10).pack(side=LEFT, padx=8)
+        ttk.Button(btns, text="✂ Slice PDF", bootstyle=SUCCESS, command=self.slice_pdf, width=20).pack(side=LEFT, padx=6)
+        ttk.Button(btns, text="Reset", bootstyle=INFO, command=self.reset, width=12).pack(side=LEFT, padx=6)
+        ttk.Button(btns, text="Quit", bootstyle=DANGER, command=self.destroy, width=10).pack(side=LEFT, padx=6)
 
-    # -------- Helpers --------
+        # RIGHT: preview card
+        preview_card = ttk.Frame(body, padding=16, bootstyle="PRIMARY")
+        preview_card.pack(side=LEFT, fill=BOTH, expand=YES)
+
+        ttk.Label(preview_card, text="Quick Preview", font=("Helvetica", 14, "bold")).pack(anchor=W)
+        ttk.Separator(preview_card).pack(fill=X, pady=6)
+
+        # Preview canvas
+        self.preview_wrap = ttk.Frame(preview_card, padding=(6, 6, 6, 6), bootstyle="secondary")
+        self.preview_wrap.pack(fill=BOTH, expand=YES)
+
+        self.preview_canvas = ttk.Canvas(self.preview_wrap, width=420, height=520, highlightthickness=0, bg="#111")
+        self.preview_canvas.pack(padx=4, pady=4)
+
+        # Slider + spinbox controls
+        control_row = ttk.Frame(preview_card)
+        control_row.pack(fill=X, pady=(8, 0))
+
+        self.page_spin = ttk.Spinbox(control_row, from_=1, to=1, textvariable=self.preview_page_var,
+                                     width=6, command=self._preview_from_controls, bootstyle="light")
+        self.page_spin.pack(side=RIGHT, padx=(6, 0))
+
+        self.page_slider = ttk.Scale(control_row, from_=1, to=1, orient=HORIZONTAL,
+                                     bootstyle="info", command=self._slider_changed)
+        self.page_slider.pack(side=RIGHT, fill=X, expand=YES, padx=(6, 6))
+
+        self.preview_hint = ttk.Label(preview_card, bootstyle=SECONDARY, padding=(6, 4))
+        self.preview_hint.pack(anchor=W, pady=(6, 0))
+        self._update_preview_hint()
+
+    def _update_preview_hint(self):
+        if self._preview_enabled:
+            self.preview_hint.config(text="Tip: Use the slider or box to change the preview page.")
+        else:
+            self.preview_hint.config(
+                text="Preview unavailable. Install PyMuPDF & Pillow:\n"
+                     "  pip install pymupdf pillow"
+            )
+
+    # ---------- Helpers ----------
     def reset(self):
         self.pdf_path = None
         self.total_pages = 0
@@ -146,6 +215,9 @@ class PDFSlicerApp(ttk.Window):
         self.mode_var.set("extract")
         self.keep_order_var.set(False)
         self.open_when_done_var.set(True)
+        self.page_range_badge.config(text="Pages: —")
+        self._close_preview_doc()
+        self._clear_preview()
 
     def _open_pdf_for_info(self, path):
         """Open the PDF just to read basic info (page count), handling encryption."""
@@ -174,14 +246,24 @@ class PDFSlicerApp(ttk.Window):
             self.total_pages = count
             self._password_cache = pwd  # remember if supplied
             self.info.config(text=f"✅ Loaded: {self.total_pages} pages | {self.pdf_path}")
+            self.page_range_badge.config(text=f"Pages: 1–{self.total_pages}")
+            self._setup_preview_controls()
+            self._open_preview_doc()
+            self._render_preview(1)
         except pikepdf.PasswordError:
             self.pdf_path = None
             self.total_pages = 0
             messagebox.showerror("Error", "PDF is encrypted and no/invalid password was provided.")
+            self.page_range_badge.config(text="Pages: —")
+            self._close_preview_doc()
+            self._clear_preview()
         except Exception as e:
             self.pdf_path = None
             self.total_pages = 0
             messagebox.showerror("Error", f"Failed to open PDF.\n{e}")
+            self.page_range_badge.config(text="Pages: —")
+            self._close_preview_doc()
+            self._clear_preview()
 
     def fill_all(self):
         if self.total_pages <= 0:
@@ -206,7 +288,89 @@ class PDFSlicerApp(ttk.Window):
         self.range_entry.delete(0, "end")
         self.range_entry.insert(0, evens)
 
-    # -------- Core slicing --------
+    # ---------- Preview handling ----------
+    def _setup_preview_controls(self):
+        # sync slider/spin bounds
+        maxp = max(1, self.total_pages or 1)
+        self.page_slider.configure(from_=1, to=maxp)
+        self.page_spin.configure(from_=1, to=maxp)
+        self.preview_page_var.set(1)
+
+    def _open_preview_doc(self):
+        self._close_preview_doc()
+        if not self._preview_enabled or not self.pdf_path:
+            return
+        try:
+            if self._password_cache:
+                self.preview_doc = fitz.open(self.pdf_path, filetype="pdf", password=self._password_cache)  # type: ignore[arg-type]
+            else:
+                self.preview_doc = fitz.open(self.pdf_path)  # type: ignore[assignment]
+        except Exception:
+            self.preview_doc = None
+
+    def _close_preview_doc(self):
+        try:
+            if self.preview_doc:
+                self.preview_doc.close()
+        finally:
+            self.preview_doc = None
+
+    def _clear_preview(self):
+        self.preview_canvas.delete("all")
+        self._preview_photo = None
+        # draw a nice placeholder
+        self.preview_canvas.create_text(
+            210, 260,
+            text="No Preview",
+            fill="#888",
+            font=("Helvetica", 16, "bold")
+        )
+
+    def _render_preview(self, page_num: int):
+        if not self._preview_enabled or not self.preview_doc:
+            self._clear_preview()
+            return
+        try:
+            pn = max(1, min(page_num, self.preview_doc.page_count))
+            page = self.preview_doc.load_page(pn - 1)
+            # Render at moderate DPI
+            zoom = 1.5  # 144 dpi-ish
+            mat = fitz.Matrix(zoom, zoom)
+            pix = page.get_pixmap(matrix=mat, alpha=False)
+
+            # Convert to PIL then to ImageTk
+            mode = "RGB"
+            img = Image.frombytes(mode, [pix.width, pix.height], pix.samples)
+            # Fit into canvas while keeping aspect
+            canvas_w, canvas_h = 420, 520
+            img.thumbnail((canvas_w - 12, canvas_h - 12))
+            self._preview_photo = ImageTk.PhotoImage(img)
+
+            self.preview_canvas.delete("all")
+            x = (canvas_w - self._preview_photo.width()) // 2
+            y = (canvas_h - self._preview_photo.height()) // 2
+            self.preview_canvas.create_image(x, y, anchor="nw", image=self._preview_photo)
+            # Small badge
+            self.preview_canvas.create_rectangle(8, 8, 98, 34, fill="#0d6efd", width=0)
+            self.preview_canvas.create_text(54, 21, text=f"Page {pn}", fill="white", font=("Helvetica", 10, "bold"))
+        except Exception:
+            # fallback
+            self._clear_preview()
+
+    def _slider_changed(self, value):
+        try:
+            pn = int(float(value))
+        except Exception:
+            pn = self.preview_page_var.get()
+        self.preview_page_var.set(pn)
+        self._render_preview(pn)
+
+    def _preview_from_controls(self):
+        pn = self.preview_page_var.get()
+        self.page_slider.set(pn)
+        self._render_preview(pn)
+
+    # ---------- Core slicing ----------
     def slice_pdf(self):
         if not self.pdf_path:
             messagebox.showerror("Error", "Please select a PDF file first.")
@@ -275,7 +439,6 @@ class PDFSlicerApp(ttk.Window):
             if self.mode_var.get() == "extract":
                 target_pages = pages_1based
             else:  # delete mode
-                # keep all pages except listed ones
                 remove_set = set(pages_1based)
                 target_pages = [p for p in range(1, total + 1) if p not in remove_set]
 
@@ -303,7 +466,7 @@ class PDFSlicerApp(ttk.Window):
                 self.update_idletasks()
 
             # Save (let pikepdf/qpdf handle compression)
-            out.save(save_path, linearize=False)  # set linearize=True for web-optimized
+            out.save(save_path, linearize=False)
             out.close()
             src.close()
 
